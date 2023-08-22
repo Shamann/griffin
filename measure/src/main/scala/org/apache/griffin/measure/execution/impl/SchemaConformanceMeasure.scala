@@ -99,8 +99,7 @@ case class SchemaConformanceMeasure(sparkSession: SparkSession, measureParam: Me
             .otherwise(false)))(_ or _)
 
     val selectCols =
-      Seq(Total, Complete, InComplete).map(e =>
-        map(lit(MetricName), lit(e), lit(MetricValue), nullToZero(col(e).cast(StringType))))
+      Seq(Total, Complete, InComplete).map(e => map(lit(e), nullToZero(col(e).cast(StringType))))
     val metricColumn: Column = array(selectCols: _*).as(valueColumn)
 
     val badRecordsDf = input.withColumn(valueColumn, when(incompleteExpr, 1).otherwise(0))

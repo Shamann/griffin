@@ -90,8 +90,7 @@ case class SparkSQLMeasure(sparkSession: SparkSession, measureParam: MeasurePara
       s"Invalid condition provided as $BadRecordDefinition. Does not yield a boolean result.")
 
     val selectCols =
-      Seq(Total, Complete, InComplete).map(e =>
-        map(lit(MetricName), lit(e), lit(MetricValue), nullToZero(col(e).cast(StringType))))
+      Seq(Total, Complete, InComplete).map(e => map(lit(e), nullToZero(col(e).cast(StringType))))
     val metricColumn: Column = array(selectCols: _*).as(valueColumn)
 
     val badRecordsDf = df.withColumn(valueColumn, when(col(valueColumn), 1).otherwise(0))
