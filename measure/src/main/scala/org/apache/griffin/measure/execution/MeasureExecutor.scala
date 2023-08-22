@@ -270,7 +270,7 @@ case class MeasureExecutor(context: DQContext, ec: ExecutionContextExecutorServi
     measureParam.getOutputOpt(OutputType.MetricOutputType) match {
       case Some(_) =>
         if (measure.supportsMetricWrite) {
-          val metricDfName = s"${measureParam.getName}_metricsDf"
+          val metricDfName = s"${measureParam.getName}_metricsDf_"
           metricsDf.createOrReplaceTempView(metricDfName)
           MetricWriteStep(measureParam.getName, metricDfName, DefaultFlattenType).execute(context)
         } else warn(s"Measure with name '${measureParam.getName}' doesn't support metric write")
