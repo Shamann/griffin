@@ -20,12 +20,13 @@ package org.apache.griffin.measure.execution.impl
 import io.netty.util.internal.StringUtil
 import org.apache.spark.sql.{Column, DataFrame, SparkSession}
 import org.apache.spark.sql.expressions.Window
-import org.apache.spark.sql.functions._
+import org.apache.spark.sql.functions.{window, _}
 import org.apache.spark.sql.types.StringType
 
 import org.apache.griffin.measure.configuration.dqdefinition.MeasureParam
 import org.apache.griffin.measure.execution.Measure
 import org.apache.griffin.measure.utils.CommonUtils.safeReduce
+import org.apache.griffin.measure.utils.ParamUtil.ParamMap
 
 /**
  * Accuracy Measure.
@@ -86,6 +87,15 @@ case class AccuracyMeasure(sparkSession: SparkSession, measureParam: MeasurePara
    */
   val refSource: String = getFromConfig[String](ReferenceSourceStr, null)
 
+  val refColumnPrefix: String = getFromConfig[String](RefColumnPrefixStr, refPrefixStr)
+
+  val sourceColumnPrefix: String = getFromConfig[String](SourceColumnPrefixStr, SourcePrefixStr)
+
+  val keepDuplicates: Boolean = getFromConfig[Boolean]("keep.duplicates", false)
+
+  val preMatchParams: Map[String, Any] =
+    getFromConfig[Map[String, String]](PreMatchStr, Map.empty)
+
   validate()
 
   /**
@@ -102,18 +112,21 @@ case class AccuracyMeasure(sparkSession: SparkSession, measureParam: MeasurePara
   override def impl(input: DataFrame): (DataFrame, DataFrame) = {
     val originalCols = input.columns
 
-    val dataSource = addColumnPrefix(input, SourcePrefixStr)
+    val dataSource = addColumnPrefixAtOnce(input, sourceColumnPrefix)
 
     val refDataSource =
-      addColumnPrefix(sparkSession.read.table(refSource), refPrefixStr)
+      addColumnPrefixAtOnce(sparkSession.read.table(refSource), refColumnPrefix)
 
     val expr = exprOpt.getOrElse(throw new AssertionError(s"'$Expression' must be defined."))
     val accuracyExprs = expr
       .map(toAccuracyExpr)
       .distinct
-      .map(x => AccuracyExpr(s"$SourcePrefixStr${x.sourceCol}", s"$refPrefixStr${x.refCol}"))
+      .map(x =>
+        AccuracyExpr(s"$sourceColumnPrefix${x.sourceCol}", s"$refColumnPrefix${x.refCol}"))
 
-    val joinExpr = safeReduce(
+    val refJoinColumns = accuracyExprs.map(x => x.refCol).toList
+
+    var joinExpr = safeReduce(
       accuracyExprs
         .map(e => col(e.sourceCol) === col(e.refCol)))(_ and _)
 
@@ -126,16 +139,77 @@ case class AccuracyMeasure(sparkSession: SparkSession, measureParam: MeasurePara
 
     val nullExpr = safeReduce(accuracyExprs.map(e => col(e.sourceCol).isNull))(_ or _)
 
-    val cols = accuracyExprs.map(_.refCol).map(col)
-    val window = Window.partitionBy(cols: _*).orderBy(cols: _*)
+    val tmpRefDataSource = if (preMatchParams.isEmpty) {
+      if (!keepDuplicates) {
+        val cols = accuracyExprs.map(_.refCol).map(col)
+        val window = Window.partitionBy(cols: _*).orderBy(cols: _*)
+        refDataSource
+          .alias("ref")
+          .withColumn(RowNumber, row_number().over(window))
+      } else {
+        refDataSource
+          .alias("ref")
+          .withColumn(RowNumber, lit(null))
+      }
+    } else {
+      val preMatchParamMap = ParamMap(preMatchParams)
+      val preMatchFiltering = preMatchParamMap.getAnyRef[String](PreMatchFilterStr, "1=1")
+      val preMatchPartitionBy = preMatchParamMap.getStringArr(PreMatchPartitionByStr)
+      val preMatchPartitionSorting =
+        preMatchParamMap.getParamStringMap(PreMatchPartitionSortingStr)
+      griffinLogger.info(
+        s"PRE-MATCHING EXPRESSION: ${preMatchPartitionBy}, " +
+          s"${preMatchPartitionSorting}, ${preMatchFiltering}")
+      var window = Window.partitionBy(preMatchPartitionBy.map(col): _*)
+      val partitionCols = (preMatchPartitionSorting map {
+        case (c, order) =>
+          order match {
+            case "asc" => asc(c)
+            case "desc" => desc(c)
+            case _ => asc(c)
+          }
+      }).toSeq
+      if (partitionCols.nonEmpty) {
+        window = window.orderBy(partitionCols: _*)
+      }
+      val columnsToSelect = refDataSource.columns ++ Array(RowNumber) ++ preMatchPartitionBy
+      val colsToSel = columnsToSelect
+        .map(c =>
+          if (preMatchPartitionBy.contains(c)) {
+            col(c).alias(s"tmp_${c.stripPrefix(s"source.${SourcePrefixStr}")}")
+          } else col(c))
+      griffinLogger.info(s"SELECTING COLUMNS: ${colsToSel.mkString(", ")}")
 
-    val recordsDf = removeColumnPrefix(
+      val originalJoinExpr = joinExpr
+      joinExpr = safeReduce(
+        preMatchPartitionBy
+          .map(e => col(e) === col(s"ref.tmp_${e.stripPrefix(s"source.${SourcePrefixStr}")}")))(
+        _ and _)
+      val tmpDf = refDataSource
+        .alias("ref")
+        .join(dataSource.alias("source"), originalJoinExpr)
+        .where(preMatchFiltering)
+        .withColumn(RowNumber, row_number().over(window))
+        .select(colsToSel: _*)
+      tmpDf
+    }
+
+    griffinLogger.info(s"JOIN EXPR ${joinExpr.toString()}")
+
+    val columnsToSelect = originalCols
+      .union(refDataSource.columns)
+      .distinct
+      .filter(c => !refJoinColumns.contains(c))
+      .toList
+    griffinLogger.info(s"COLUMNS TO SELECT ${columnsToSelect}")
+    val recordsDf = removeColumnPrefixAtOnce(
       dataSource
-        .join(refDataSource.withColumn(RowNumber, row_number().over(window)), joinExpr, "left")
+        .alias("source")
+        .join(tmpRefDataSource.alias("ref"), joinExpr, "left")
         .where(col(RowNumber) === 1 or col(RowNumber).isNull)
         .withColumn(valueColumn, when(indicatorExpr or nullExpr, 1).otherwise(0)),
       SourcePrefixStr)
-      .select((originalCols :+ valueColumn).map(col): _*)
+      .select((columnsToSelect :+ valueColumn).map(col): _*)
 
     val selectCols =
       Seq(Total, AccurateStr, InAccurateStr).map(e =>
@@ -222,6 +296,11 @@ case class AccuracyMeasure(sparkSession: SparkSession, measureParam: MeasurePara
     columns.foldLeft(dataFrame)((df, c) => df.withColumnRenamed(c, s"$prefix$c"))
   }
 
+  private def addColumnPrefixAtOnce(dataFrame: DataFrame, prefix: String): DataFrame = {
+    val renamedColumns = dataFrame.columns.map(c => col(c).alias(s"$prefix$c"))
+    dataFrame.select(renamedColumns: _*)
+  }
+
   /**
    * Helper method to strip a prefix from all column names that previously helped in uniquely identify them.
    *
@@ -232,6 +311,11 @@ case class AccuracyMeasure(sparkSession: SparkSession, measureParam: MeasurePara
   private def removeColumnPrefix(dataFrame: DataFrame, prefix: String): DataFrame = {
     val columns = dataFrame.columns
     columns.foldLeft(dataFrame)((df, c) => df.withColumnRenamed(c, c.stripPrefix(prefix)))
+  }
+
+  private def removeColumnPrefixAtOnce(dataFrame: DataFrame, prefix: String): DataFrame = {
+    val columnsRenamed = dataFrame.columns.map(c => col(c).alias(c.stripPrefix(prefix)))
+    dataFrame.select(columnsRenamed: _*)
   }
 }
 
@@ -246,6 +330,14 @@ object AccuracyMeasure {
   final val SourceColStr: String = "source.col"
   final val ReferenceColStr: String = "ref.col"
 
+  final val RefColumnPrefixStr: String = "ref.prefix"
+  final val SourceColumnPrefixStr: String = "source.prefix"
+
   final val AccurateStr: String = "accurate"
   final val InAccurateStr: String = "inaccurate"
+
+  final val PreMatchStr = "pre.match"
+  final val PreMatchPartitionByStr = "partitionBy"
+  final val PreMatchPartitionSortingStr = "partitionSorting"
+  final val PreMatchFilterStr = "filter"
 }

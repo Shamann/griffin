@@ -17,8 +17,14 @@
 
 package org.apache.griffin.measure
 
+import java.io.{BufferedReader, BufferedWriter, File, FileReader, FileWriter}
+import java.nio.file.{Files, Path, Paths}
+
+import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
 import scala.util.{Failure, Success, Try}
+
+import org.apache.commons.io.FileUtils
 
 import org.apache.griffin.measure.configuration.dqdefinition.{
   DQConfig,
@@ -76,6 +82,8 @@ object Application extends Loggable {
         sys.exit(-4)
     }
 
+    val job_name = allParam.getDqConfig.getName
+
     startup()
 
     // dq app init
@@ -84,7 +92,13 @@ object Application extends Loggable {
         info("process init success")
       case Failure(ex) =>
         error(s"process init error: ${ex.getMessage}", ex)
-        shutdown()
+        try {
+          shutdown(job_name)
+        } catch {
+          case e: Exception =>
+            error(e.getMessage, e)
+            sys.exit(-5)
+        }
         sys.exit(-5)
     }
 
@@ -100,7 +114,13 @@ object Application extends Loggable {
         if (dqApp.retryable) {
           throw ex
         } else {
-          shutdown()
+          try {
+            shutdown(job_name)
+          } catch {
+            case e: Exception =>
+              error(e.getMessage, e)
+              sys.exit(-5)
+          }
           sys.exit(-5)
         }
     }
@@ -111,11 +131,23 @@ object Application extends Loggable {
         info("process end success")
       case Failure(ex) =>
         error(s"process end error: ${ex.getMessage}", ex)
-        shutdown()
+        try {
+          shutdown(job_name)
+        } catch {
+          case e: Exception =>
+            error(e.getMessage, e)
+            sys.exit(-5)
+        }
         sys.exit(-5)
     }
 
-    shutdown()
+    try {
+      shutdown(job_name)
+    } catch {
+      case e: Exception =>
+        error(e.getMessage, e)
+        sys.exit(-5)
+    }
 
     if (!success) {
       sys.exit(-5)
@@ -131,6 +163,68 @@ object Application extends Loggable {
 
   private def startup(): Unit = {}
 
-  private def shutdown(): Unit = {}
+  private def shutdown(job_name: String): Unit = {
+    val directoryName = s"/data01/tmp/${job_name}"
+    val outputDir = new File(directoryName)
+    if (outputDir.exists()) {
+      val directoryStream = Files.walk(Paths.get(directoryName)).iterator().asScala.toStream
+      griffinLogger.info(s"Processing paths in ${directoryName}:")
+      directoryStream
+        .filter(Files.isDirectory(_))
+        .filter(_.toString.endsWith(".csv"))
+        .foreach(mergeFiles(_))
 
+      FileUtils.deleteDirectory(outputDir);
+      griffinLogger.info("Done!")
+    }
+  }
+
+  private def mergeFiles(dir: Path): Unit = {
+    val outputFilePath =
+      dir.toString.replaceAll("/data01/tmp/griffin-matcher[^/]*", "").replaceAll("//", "/")
+    val directoryStream = Files.list(dir).iterator().asScala.toStream
+    val csvFiles = directoryStream
+      .filter(Files.isRegularFile(_))
+      .filter(_.toString.endsWith(".csv"))
+      .map(_.toFile)
+      .toList
+    val outputFile = new File(outputFilePath)
+    val parentDir = outputFile.getParentFile().getAbsolutePath()
+    val directory = new File(parentDir)
+    directory.mkdirs()
+    if (outputFile.exists()) {
+      griffinLogger.info(s"File ${outputFilePath} already exists.")
+      if (outputFile.delete()) {
+        griffinLogger.info(s"File ${outputFilePath} was deleted.")
+      } else {
+        throw new Exception(s"Couldn't delete file ${outputFilePath}")
+      }
+    }
+    if (outputFile.createNewFile()) {
+      val writer = new BufferedWriter(new FileWriter(outputFile))
+      csvFiles.zipWithIndex.foreach {
+        case (f, idx) =>
+          griffinLogger.info(s"Processing ${f.toString}")
+          var reader: BufferedReader = null
+          try {
+            reader = new BufferedReader(new FileReader(f))
+            var line = reader.readLine()
+            var isHeader = true
+            while (line != null) {
+              if ((isHeader && idx == 0) || !isHeader) {
+                writer.write(line)
+                writer.newLine()
+              }
+              isHeader = false
+              line = reader.readLine()
+            }
+          } finally {
+            if (reader != null) {
+              reader.close()
+            }
+          }
+      }
+      writer.close()
+    }
+  }
 }
