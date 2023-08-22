@@ -57,7 +57,7 @@ case class StreamingDQApp(allParam: GriffinConfig) extends DQApp {
     val conf = new SparkConf().setAppName(metricName)
     conf.setAll(sparkParam.getConfig)
     conf.set("spark.sql.crossJoin.enabled", "true")
-    sparkSession = SparkSession.builder().config(conf).enableHiveSupport().getOrCreate()
+    sparkSession = SparkSession.builder().config(conf).getOrCreate()
     val logLevel = getGriffinLogLevel
     sparkSession.sparkContext.setLogLevel(sparkParam.getLogLevel)
     griffinLogger.setLevel(logLevel)
