@@ -64,6 +64,7 @@ case class SinkFactory(sinkParamIter: Seq[SinkParam], jobName: String)
       case ElasticSearch => Try(ElasticSearchSink(config, jobName, timeStamp, block))
       case MongoDB => Try(MongoSink(config, jobName, timeStamp, block))
       case Custom => Try(getCustomSink(config, timeStamp, block))
+      case Redis => Try(RedisSink(config, jobName, timeStamp))
       case _ => throw new Exception(s"sink type $sinkType is not supported!")
     }
     sinkTry match {

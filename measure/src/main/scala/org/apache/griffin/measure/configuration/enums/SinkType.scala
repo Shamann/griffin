@@ -32,7 +32,7 @@ import org.apache.griffin.measure.configuration.enums
 object SinkType extends GriffinEnum {
   type SinkType = Value
 
-  val Console, Log, Hdfs, Es, Http, ElasticSearch, MongoDB, Mongo, Custom =
+  val Console, Log, Hdfs, Es, Http, ElasticSearch, MongoDB, Mongo, Custom, Redis =
     Value
 
   def validSinkTypes(sinkTypeSeq: Seq[String]): Seq[SinkType] = {
