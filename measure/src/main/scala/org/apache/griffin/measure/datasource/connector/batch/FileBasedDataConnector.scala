@@ -104,7 +104,7 @@ case class FileBasedDataConnector(
    */
   private def getUserDefinedSchema: StructType = {
     schemaSeq.foldLeft(new StructType())((currentStruct, fieldMap) => {
-      val colName = fieldMap(ColName).toLowerCase
+      val colName = fieldMap(ColName)
       val colType = fieldMap(ColType).toLowerCase
       val isNullable = Try(fieldMap(IsNullable).toLowerCase.toBoolean).getOrElse(true)
 
