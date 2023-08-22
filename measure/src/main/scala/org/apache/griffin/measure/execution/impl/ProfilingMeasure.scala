@@ -19,9 +19,10 @@ package org.apache.griffin.measure.execution.impl
 
 import io.netty.util.internal.StringUtil
 import org.apache.spark.sql._
-import org.apache.spark.sql.functions._
+import org.apache.spark.sql.functions.{lit, _}
 import org.apache.spark.sql.types._
 
+import org.apache.griffin.measure.Loggable
 import org.apache.griffin.measure.configuration.dqdefinition.MeasureParam
 import org.apache.griffin.measure.execution.Measure
 import org.apache.griffin.measure.execution.Measure._
@@ -96,6 +97,9 @@ case class ProfilingMeasure(sparkSession: SparkSession, measureParam: MeasurePar
   val approxDistinctCount: Boolean =
     getFromConfig[java.lang.Boolean](ApproxDistinctCountStr, true)
 
+  val datetimeFormats: Map[String, String] =
+    getFromConfig(DatetimeFormats, Map.empty[String, String])
+
   validate()
 
   /**
@@ -120,15 +124,14 @@ case class ProfilingMeasure(sparkSession: SparkSession, measureParam: MeasurePar
    */
   override def impl(dataSource: DataFrame): (DataFrame, DataFrame) = {
     info(s"Selecting random ${dataSetSample * 100}% of the rows for profiling.")
-    val input = dataSource.sample(dataSetSample)
-    val profilingColNames = keyCols(input)
-
-    val profilingCols = input.schema.fields.filter(f => profilingColNames.contains(f.name))
+    val profilingColNames = keyCols(dataSource)
+    val profilingCols = dataSource.schema.fields.filter(f => profilingColNames.contains(f.name))
+    val input = dataSource.sample(dataSetSample).select(profilingColNames.map(col): _*)
 
     val profilingExprs = profilingCols.foldLeft(Array.empty[Column])((exprList, field) => {
       val colName = field.name
       val profilingExprs =
-        getProfilingExprs(field, roundScale, approxDistinctCount, dataSetSample).map(nullToZero)
+        getProfilingExprs(field, roundScale, approxDistinctCount, dataSetSample, datetimeFormats)
 
       exprList.:+(map(profilingExprs: _*).as(s"$DetailsPrefix$colName"))
     })
@@ -179,7 +182,7 @@ case class ProfilingMeasure(sparkSession: SparkSession, measureParam: MeasurePar
 /**
  * Profiling measure constants
  */
-object ProfilingMeasure {
+object ProfilingMeasure extends Loggable {
 
   /**
    * Options Keys
@@ -187,6 +190,7 @@ object ProfilingMeasure {
   final val DataSetSampleStr: String = "dataset.sample"
   final val RoundScaleStr: String = "round.scale"
   final val ApproxDistinctCountStr: String = "approx.distinct.count"
+  final val DatetimeFormats: String = "datetime.formats"
 
   /**
    * Structure Keys
@@ -216,13 +220,17 @@ object ProfilingMeasure {
   private final val MinColLength: String = s"${Min}_$ColumnLengthPrefix"
   private final val MaxColLength: String = s"${Max}_$ColumnLengthPrefix"
   private final val AvgColLength: String = s"${Avg}_$ColumnLengthPrefix"
+  private final val Hist: String = "hist"
 
   private def lengthColFn(colName: String): String = s"${ColumnLengthPrefix}_$colName"
 
   private def nullsInColFn(colName: String): String = s"${IsNullPrefix}_$colName"
 
   private def forNumericFn(t: DataType, value: Column, alias: String): Column = {
-    (if (t.isInstanceOf[NumericType]) value else lit(null)).as(alias)
+    (if (t.isInstanceOf[NumericType]) value else lit(null).cast(NullType)).as(alias)
+  }
+  private def forStringFn(t: DataType, value: Column, alias: String): Column = {
+    (if (t.isInstanceOf[StringType]) value else lit(null).cast(NullType)).as(alias)
   }
 
   /**
@@ -237,7 +245,8 @@ object ProfilingMeasure {
       field: StructField,
       roundScale: Int,
       approxDistinctCount: Boolean,
-      dataSetSample: Double): Seq[Column] = {
+      dataSetSample: Double,
+      datetimeFormats: Map[String, String]): Seq[Column] = {
     val colName = field.name
     val colType = field.dataType
 
@@ -257,21 +266,38 @@ object ProfilingMeasure {
       Seq(lit(distinctCountName), distinctCountExpr)
     } else Nil
 
-    Seq(
-      Seq(lit(DataTypeStr), lit(colType.catalogString).as(DataTypeStr)),
-      Seq(lit(Total), sum(lit(1)).as(Total)),
-      Seq(lit(MinColLength), min(lengthColExpr).as(MinColLength)),
-      Seq(lit(MaxColLength), max(lengthColExpr).as(MaxColLength)),
-      Seq(lit(AvgColLength), avg(lengthColExpr).as(AvgColLength)),
-      Seq(lit(Min), forNumericFn(colType, min(column), Min)),
-      Seq(lit(Max), forNumericFn(colType, max(column), Max)),
-      Seq(lit(Avg), forNumericFn(colType, bround(avg(column), roundScale), Avg)),
-      Seq(
-        lit(StdDeviation),
-        forNumericFn(colType, bround(stddev(column), roundScale), StdDeviation)),
-      Seq(lit(Variance), forNumericFn(colType, bround(variance(column), roundScale), Variance)),
-      Seq(lit(Kurtosis), forNumericFn(colType, bround(kurtosis(column), roundScale), Kurtosis)),
-      distinctExpr,
-      Seq(lit(NullCount), sum(nullColExpr).as(NullCount))).flatten
+    colType match {
+      case _: NumericType =>
+        Seq(
+          Seq(lit(DataTypeStr), lit(colType.catalogString).as(DataTypeStr)),
+          Seq(lit(Total), sum(lit(1)).as(Total)),
+          Seq(lit(Max), max(column).as(Max)),
+          Seq(lit(Min), min(column).as(Min)),
+          distinctExpr,
+          Seq(lit(NullCount), sum(nullColExpr).as(NullCount)),
+          Seq(lit(Avg), bround(avg(column), roundScale).as(Avg)),
+          Seq(lit(StdDeviation), bround(stddev(column), roundScale).as(StdDeviation)),
+          Seq(lit(Variance), bround(variance(column), roundScale).as(Variance))).flatten
+      case _: DateType | _: TimestampType =>
+        val fmt = datetimeFormats.getOrElse(colName, "yyyy-MM-DD")
+        val col = to_date(column, fmt)
+        Seq(
+          Seq(lit(DataTypeStr), lit(colType.catalogString).as(DataTypeStr)),
+          Seq(lit(Total), sum(lit(1)).as(Total)),
+          Seq(lit(Max), max(col).as(Max)),
+          Seq(lit(Min), min(col).as(Min)),
+          distinctExpr,
+          Seq(lit(NullCount), sum(nullColExpr).as(NullCount))).flatten
+      case _: StringType =>
+        Seq(
+          Seq(lit(DataTypeStr), lit(colType.catalogString).as(DataTypeStr)),
+          Seq(lit(Total), sum(lit(1)).as(Total)),
+          Seq(lit(MinColLength), min(lengthColExpr).as(MinColLength)),
+          Seq(lit(MaxColLength), max(lengthColExpr).as(MaxColLength)),
+          Seq(lit(AvgColLength), avg(lengthColExpr).as(AvgColLength)),
+          distinctExpr,
+          Seq(lit(NullCount), sum(nullColExpr).as(NullCount))).flatten
+      case _ => Nil
+    }
   }
 }
