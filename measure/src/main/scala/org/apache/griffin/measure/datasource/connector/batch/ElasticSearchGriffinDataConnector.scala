@@ -82,7 +82,8 @@ case class ElasticSearchGriffinDataConnector(
         val answer = httpPost(path, sql)
         if (answer._1) {
           import sparkSession.implicits._
-          val rdd: RDD[String] = sparkSession.sparkContext.parallelize(answer._2.lines.toList)
+          val rdd: RDD[String] =
+            sparkSession.sparkContext.parallelize(answer._2.linesIterator.toList)
           val reader: DataFrameReader = sparkSession.read
           reader.option("header", value = true).option("inferSchema", value = true)
           val df: DataFrame = reader.csv(rdd.toDS())
